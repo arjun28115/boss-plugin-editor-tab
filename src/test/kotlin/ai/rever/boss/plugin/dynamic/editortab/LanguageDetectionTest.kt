@@ -123,6 +123,40 @@ class LanguageDetectionTest {
         }
     }
 
+    // ------------------------------------------------------- host table agreement
+
+    /**
+     * Shell scripts are `bash`, which is the id the host's canonical table uses.
+     *
+     * This copy said `shell` and the host said `bash` for the same file, which is the
+     * disagreement BossConsole#75 was filed about: the id a `.sh` file gets depended on which
+     * route opened it. Pinned here because nothing at build time compares the two tables, and
+     * this repository cannot import the host's.
+     */
+    @Test
+    fun `shell scripts use the host's id`() {
+        assertEquals("bash", LanguageDetection.detect("/srv/app/deploy.sh"))
+        assertEquals("bash", LanguageDetection.detect("/srv/app/deploy.bash"))
+        assertEquals("bash", LanguageDetection.detect("/srv/app/deploy.zsh"))
+    }
+
+    /**
+     * And the id change does not change which lexer runs.
+     *
+     * [LanguageDetection.lexerFor] accepts both spellings, so this is the assertion that makes
+     * the rename safe rather than merely consistent: a file that highlighted before still does.
+     */
+    @Test
+    fun `both shell spellings still resolve to the same lexer`() {
+        val viaDetect = LanguageDetection.lexerFor(LanguageDetection.detect("/srv/app/deploy.sh"))
+        assertNotNull(viaDetect, "a detected shell script must reach a lexer")
+        assertEquals(
+            LanguageDetection.lexerFor("shell")!!::class,
+            viaDetect::class,
+            "the old id and the new one must select the same lexer",
+        )
+    }
+
     @Test
     fun `unknown languages still return no lexer`() {
         assertNull(LanguageDetection.lexerFor("text"))
