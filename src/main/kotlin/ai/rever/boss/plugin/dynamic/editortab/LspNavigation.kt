@@ -530,13 +530,23 @@ class LspNavigation {
 
     private fun trackClient(key: ServerKey, client: LspClient): Boolean {
         val previous = clients.put(key, client)
-        previous?.takeIf { it !== client }?.let(opened::remove)
+        previous?.takeIf { it !== client }?.let {
+            opened.remove(it)
+            hoverTimeoutLogged.remove(it)
+        }
         return previous !== client
     }
 
     /** Test seam for the restart eviction invariant without constructing a real manager. */
     internal fun trackClient(languageId: String, root: String, client: LspClient): Boolean =
         trackClient(ServerKey(languageId, root), client)
+
+    /** Test seams for the hover-timeout dedupe set, without driving a real timeout. */
+    internal fun hoverTimeoutLogged(client: LspClient): Boolean = hoverTimeoutLogged.contains(client)
+
+    internal fun markHoverTimeoutLogged(client: LspClient) {
+        hoverTimeoutLogged.add(client)
+    }
 
     internal fun didOpen(uri: String, languageId: String, content: String): JsonElement =
         buildJsonObject {

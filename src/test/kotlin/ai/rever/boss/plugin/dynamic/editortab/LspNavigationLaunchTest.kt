@@ -756,7 +756,13 @@ class LspNavigationLaunchTest {
         nav.syncDocument(first, "file:///a.ts", "typescript", "two")
 
         val restarted = RecordingClient()
+        // The old client had a logged hover timeout: its dedupe entry holds a
+        // strong reference (transport + process streams) and must be evicted
+        // with its opened entry, not kept until dispose().
+        nav.markHoverTimeoutLogged(first)
+        assertTrue(nav.hoverTimeoutLogged(first))
         assertTrue(nav.trackClient("typescript", "/root", restarted))
+        assertFalse(nav.hoverTimeoutLogged(first), "a replaced client's hover-timeout entry is evicted with its opened entry")
         nav.syncDocument(restarted, "file:///a.ts", "typescript", "three")
         nav.syncDocument(restarted, "file:///a.ts", "typescript", "four")
 
