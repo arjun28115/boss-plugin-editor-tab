@@ -1,13 +1,14 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
 import ai.rever.boss.plugin.api.AiChunk
-import ai.rever.boss.plugin.api.AiAvailability
 import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.AiReadiness
 import ai.rever.boss.plugin.api.AiMessage
 import ai.rever.boss.plugin.api.AiRequest
 import ai.rever.boss.plugin.api.PluginContext
+import ai.rever.bosseditor.core.EditorDocument
 import ai.rever.bosseditor.core.EditorPosition
+import ai.rever.bosseditor.core.EditorRange
 import ai.rever.bosseditor.core.EditorState
 import ai.rever.bosseditor.lsp.protocol.Position
 import ai.rever.bosseditor.lsp.protocol.Range
@@ -31,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -41,16 +43,14 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Cmd+K inline AI edit (IDE batch P4.2).
+ * Cmd/Ctrl+I or Cmd/Ctrl+K inline AI edit (IDE batch P4.2).
  *
  * The selection (or the caret's line when nothing is selected) is sent to the
- * active AI provider with a "rewrite only this code" prompt; the reply is
- * shown in the library's RefactorPreviewDialog and applied through the
- * shared buffer's document - one undo step, and refused with a stale error
- * when the buffer moved since the request started.
+ * active AI provider with a "rewrite only this code" prompt. Review is rendered from a shadow
+ * EditorState, so the live buffer, LSP, autosave and other splits do not observe a proposed edit.
  *
- * Degrades to nothing without a gateway: the Cmd+K handler bails before
- * consuming the key when no AiGatewayAPI is registered.
+ * Opens even when AI is unavailable so the prompt can explain whether the
+ * shared provider or gateway needs configuration.
  */
 class AiInlineEditService(
     private val context: PluginContext,
@@ -70,6 +70,8 @@ class AiInlineEditService(
         val startCol: Int = 0,
         val endLine: Int = 0,
         val endCol: Int = 0,
+        val anchorLine: Int = startLine,
+        val anchorCol: Int = startCol,
         val bufferVersion: Long = 0,
         val language: String = "",
     )
@@ -95,24 +97,35 @@ class AiInlineEditService(
 
     /** @return true when a session was started (so the key event is consumed). */
     fun start(editorState: EditorState, language: String): Boolean {
-        // A missing gateway used to return false here, so Cmd+K did nothing at
+        // The shortcut tunnels through the whole tab, including the prompt itself. Refuse
+        // re-entry so a second press cannot replace the captured offsets while the first
+        // generation is still streaming and later graft its replacement onto a new selection.
+        if (_session.value != null) return true
+        // A missing gateway used to return false here, so the compose shortcut did nothing at
         // all - indistinguishable from a broken keybinding. Open the widget
         // either way and let it say which of the two things is actually wrong.
-        val unavailable = describeReadiness(AiAvailability.check(context))
         val state = this.editorState ?: editorState
         val doc = state.document
-        val selection = state.selection.value
-        val hasSelection = state.hasSelection && selection != null
-        val start = if (hasSelection) selection!!.start else state.caretPosition.value
-        val end =
-            if (hasSelection) {
-                selection!!.end
-            } else {
-                EditorPosition(start.line, doc.getLineLength(start.line))
-            }
-        val startOffset = doc.positionToOffset(start)
+        val selection = state.selection.value?.takeIf { state.hasSelection }
+        val caret = state.caretPosition.value
+        var start = selection?.start ?: caret
+        val end = selection?.end ?: EditorPosition(start.line, doc.getLineLength(start.line))
+        var startOffset = doc.positionToOffset(start)
         val endOffset = doc.positionToOffset(end)
-        if (startOffset == endOffset) return true // caret on an empty line: consume, nothing to edit
+        if (startOffset == endOffset) {
+            // Caret at the end of a line, or on a blank line: the caret-to-EOL
+            // target is empty. When the line has real text, expand to the whole
+            // line so the compose edits it. When the line is blank, keep the
+            // EMPTY target at the caret - the compose generates there, and the
+            // line's indentation survives instead of being overwritten. Cmd+K
+            // opens the compose regardless of where the caret sits.
+            val lineStart = EditorPosition(start.line, 0)
+            val lineText = doc.getText(doc.positionToOffset(lineStart), endOffset)
+            if (lineText.isNotBlank()) {
+                start = lineStart
+                startOffset = doc.positionToOffset(lineStart)
+            }
+        }
         _session.value =
             Session(
                 selectionText = doc.getText(startOffset, endOffset),
@@ -120,9 +133,15 @@ class AiInlineEditService(
                 startCol = start.column,
                 endLine = end.line,
                 endCol = end.column,
+                // Anchor at the active edge of the selection, rather than assuming that its
+                // normalized end is where the user finished selecting.
+                anchorLine = caret.line,
+                anchorCol = caret.column,
                 bufferVersion = buffer?.version ?: doc.documentVersion,
                 language = language,
-                error = unavailable,
+                // Provider registration and credential loading are asynchronous.
+                // Resolve when the user submits instead of showing a false error now.
+                error = null,
             )
         return true
     }
@@ -139,22 +158,32 @@ class AiInlineEditService(
     fun submit() {
         val s = _session.value ?: return
         if (s.prompt.isBlank() || s.busy) return
-        describeReadiness(AiAvailability.check(context))?.let { reason ->
-            _session.value = s.copy(error = reason)
-            return
-        }
-        val gateway = context.getPluginAPI(AiGatewayAPI::class.java) ?: return
         val state = editorState ?: return
         val doc = state.document
         job?.cancel()
         job =
             scope.launch {
                 _session.value = s.copy(busy = true, error = null)
+                val gateway = awaitEditorAiGateway(context)
+                if (gateway == null) {
+                    _session.value = _session.value?.copy(
+                        busy = false,
+                        error = describeReadiness(editorAiReadiness(context)) ?: "AI is unavailable",
+                    )
+                    return@launch
+                }
                 var text = ""
                 try {
+                    // A blank target (an empty line, or a caret parked at the end of
+                    // one) generates at the caret, so attach a few lines of context
+                    // around it: with no file context at all, the model has nothing
+                    // to generate FROM, and its "rewrite" of nothing comes back
+                    // near-empty, which the isBlank check below then reports as an
+                    // error.
+                    val context = if (s.selectionText.isBlank()) caretContext(doc, s.anchorLine, s.anchorCol) else null
                     withContext(Dispatchers.IO) {
                         withTimeoutOrNull(REQUEST_TIMEOUT_MS) {
-                            gateway.stream(buildRequest(s.prompt, s.selectionText, s.language)).collect { chunk ->
+                            gateway.stream(buildRequest(s.prompt, s.selectionText, s.language, context)).collect { chunk ->
                                 when (chunk) {
                                     is AiChunk.Text -> {
                                         text += chunk.text
@@ -171,6 +200,10 @@ class AiInlineEditService(
                             }
                         }
                     } ?: throw java.util.concurrent.TimeoutException("AI request timed out")
+                } catch (cancellation: CancellationException) {
+                    // cancel() may be followed immediately by a new session. Do not let the old
+                    // generation stamp its cancellation error onto that replacement session.
+                    throw cancellation
                 } catch (e: Exception) {
                     _session.value = _session.value?.copy(busy = false, error = e.message ?: "AI request failed")
                     return@launch
@@ -180,8 +213,9 @@ class AiInlineEditService(
                     _session.value = _session.value?.copy(busy = false, error = "The model returned no replacement")
                     return@launch
                 }
-                // Build the library's preview (windowed before/after) on the
-                // buffer's content at response time.
+                // Build preview metadata on the buffer's content at response time. The UI also
+                // builds a read-only shadow EditorState; the live document stays untouched until
+                // Accept.
                 val uri = buffer?.path ?: ""
                 val edit =
                     TextEdit(
@@ -236,7 +270,7 @@ class AiInlineEditService(
      * there is one, the viewport's own document version when there is not.
      * Consulting only the buffer left every buffer-less viewport (an untitled
      * document, or any viewport holding a private EditorState) with NO
-     * staleness check at all, so a Cmd+K rewrite accepted after the user had
+     * staleness check at all, so an inline rewrite accepted after the user had
      * typed applied at pre-typing offsets.
      */
     private fun currentVersion(): Long? = buffer?.version ?: editorState?.document?.documentVersion
@@ -262,7 +296,12 @@ class AiInlineEditService(
         val start = doc.positionToOffset(s.startLine, s.startCol)
         val end = doc.positionToOffset(s.endLine, s.endCol)
         if (start !in 0..doc.length || end !in 0..doc.length || start > end) return false
-        doc.replace(start, end, s.replacement)
+        applyAcceptedAiInlineEdit(
+            state = state,
+            start = EditorPosition(s.startLine, s.startCol),
+            end = EditorPosition(s.endLine, s.endCol),
+            replacement = s.replacement,
+        )
         _session.value = null
         return true
     }
@@ -308,26 +347,72 @@ class AiInlineEditService(
                 "markdown fences, no commentary, no diff markers, no repetition of " +
                 "surrounding code."
 
+        private const val GENERATE_SYSTEM_PROMPT =
+            "You are an inline code-generation engine. The user placed the caret in " +
+                "code and asked you to generate code there. Output ONLY the code to " +
+                "insert at the caret: no markdown fences, no commentary, no " +
+                "surrounding code, no repetition of context lines."
+
         internal fun buildRequest(
             prompt: String,
             selectionText: String,
             language: String,
-        ): AiRequest =
-            AiRequest(
-                system = SYSTEM_PROMPT,
+            /** A few lines around the caret, generate mode only (see [caretContext]). */
+            context: String? = null,
+        ): AiRequest {
+            val generating = selectionText.isBlank()
+            return AiRequest(
+                system = if (generating) GENERATE_SYSTEM_PROMPT else SYSTEM_PROMPT,
                 messages =
                     listOf(
                         AiMessage.user(
                             "Language: $language\n" +
                                 "Instruction: $prompt\n" +
-                                "<selected_code>\n$selectionText</selected_code>\n" +
-                                "Output only the rewritten selected code.",
+                                if (generating) {
+                                    context?.let { "$it\n" }.orEmpty() +
+                                        "Generate the code to insert at the caret."
+                                } else {
+                                    "<selected_code>\n$selectionText</selected_code>\n" +
+                                        "Output only the rewritten selected code."
+                                },
                         ),
                     ),
-                temperature = 0f,
                 maxTokens = 4096,
                 timeoutMs = 45_000,
+                temperature = 0f,
             )
+        }
+
+        /**
+         * A few lines before and after [line], for generate mode: a Cmd+K on an
+         * empty line gives the model an instruction and nothing else, so the
+         * nearest context is what makes "generate at the caret" mean anything.
+         * The caret's position inside the block is stated explicitly rather
+         * than marked, so a context that contains `// caret` comments or the
+         * like cannot mislead the model. Null when there is nothing to show.
+         */
+        internal fun caretContext(
+            doc: EditorDocument,
+            line: Int,
+            col: Int = 0,
+            before: Int = 3,
+            after: Int = 3,
+        ): String? {
+            val count = doc.lineCount
+            if (count == 0) return null
+            val clamped = line.coerceIn(0, count - 1)
+            val from = (clamped - before).coerceAtLeast(0)
+            var to = (clamped + after).coerceAtMost(count - 1)
+            // A trailing blank line reads as a separator, not as context -
+            // drop it, but NEVER above the caret: the stated caret line must
+            // always exist inside the block. Trimming below the caret keeps
+            // the caret's own (blank) line as the block's last line.
+            while (to > clamped && doc.getLineLength(to) == 0) to--
+            if (from == to && doc.getLineLength(from) == 0) return null
+            val block = (from..to).joinToString("\n") { doc.getLineText(it) }
+            return "<context>\n$block\n</context>\n" +
+                "The caret is on line ${clamped - from + 1} (1-based) of this block, column ${col + 1}."
+        }
 
         internal fun stripFences(text: String): String {
             var t = text
@@ -337,4 +422,25 @@ class AiInlineEditService(
             return t.trimEnd()
         }
     }
+}
+
+/** Applies an accepted proposal as one undo step, isolated from the preceding typing group. */
+internal fun applyAcceptedAiInlineEdit(
+    state: EditorState,
+    start: EditorPosition,
+    end: EditorPosition,
+    replacement: String,
+) {
+    state.undoManager.breakUndoGroup()
+    if (start == end) {
+        // Degenerate (generate-mode) target: an empty selection inserts at
+        // the LIVE caret, not at the captured one - and the staleness guard
+        // only compares the buffer version, so a pointer that wandered while
+        // the preview was open would silently land the code somewhere else.
+        // Move the caret to the captured position first.
+        state.moveCaretToOffset(state.document.positionToOffset(start))
+    }
+    state.setSelection(EditorRange(start, end))
+    state.insertText(replacement)
+    state.undoManager.breakUndoGroup()
 }
